@@ -1,0 +1,152 @@
+---
+- hosts: localhost
+  connection: local
+  vars_files:
+    - ./vars/credentials.yml
+    - ./vars/instances.yml
+  vars:
+    aws_region: "eu-west-1"
+    #aws_region: "eu-central-1"
+#    aws_key: "id_rsa"
+    inst_type: "t2.micro"
+    inst_state: "present"
+    sg_name: "for_nginx"
+    distro: "*amzn2-ami-hvm-*-x86_64-gp2"
+    owner_id: "137112412989"
+    key_location: "./my_key.pem"
+    user_name: "ec2-user"
+
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ access_key }}"
+    AWS_SECRET_ACCESS_KEY: "{{ secret_key }}"
+    AWS_REGION: "{{ aws_region }}"
+
+  tasks:
+    - name: Configure EC2 Security Group.
+      ec2_group:
+        name: "{{ sg_name }}"
+        description: HTTP security
+        state: "{{ inst_state }}"
+        rules:
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0 # my_private_ip/32 when I would have it )))
+        rules_egress:
+          - proto: all
+            from_port: 0
+            to_port: 65535
+            cidr_ip: 0.0.0.0/0
+
+    - name: gather facts about an AMI using ami-id
+      ec2_ami_info:
+        owners: "{{ owner_id }}"
+        filters:
+          name: "{{ distro }}"
+      register: ami_info
+
+    - set_fact:
+        full_ami_info: "{{ ami_info.images | sort(attribute='creation_date') | last }}"
+
+    - set_fact:
+        needed_ami_id: "{{ full_ami_info.image_id }}"
+
+    - name: create EC2 key
+      ec2_key:
+          name: my_key
+          region: "{{ aws_region }}"
+      register: ec2_key
+
+    - name: save key
+      copy: content="{{ ec2_key.key.private_key }}" dest="{{ key_location }}" mode=0600
+      when: ec2_key.changed
+
+    - name: create ec2 instances
+      ec2:
+#        state: "{{ inst_state }}"
+        key_name: "{{ ec2_key.key.name }}"
+        instance_type: "{{ inst_type }}"
+        user_data: |
+          #!/bin/sh
+          sudo rpm -qa | grep -qw nginx || sudo amazon-linux-extras install nginx1.12 -y && sudo systemctl enable --now nginx
+        image: "{{ needed_ami_id }}"
+        wait: True
+        wait_timeout: 600
+        vpc_subnet_id: "{{ item.1.subnet }}"
+        assign_public_ip: "{{ item.1.assign_public_ip | default(False) }}"
+        group: "{{ sg_name }}"
+        instance_tags:
+          Name: "{{ item.0.name }}-{{ item.1.seq_num }}"
+          role: "{{ item.0.name }}"
+          i_group: "{{ item.0.name }}-{{ item.1.subnet }}"
+        exact_count: 1
+        count_tag:
+          Name: "{{ item.0.name }}-{{ item.1.seq_num }}"
+      with_subelements:
+        - "{{ instances }}"
+        - subnets
+      register: ec2
+
+    - name: Get lb inst info
+      ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          instance-state-name: running
+          "tag:role": web
+      register: lb_info
+
+    - name: Get app inst info
+      ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          instance-state-name: running
+          "tag:role": app
+      register: app_info
+
+    - name: Refresh in-memory EC2 cache
+      meta: refresh_inventory
+
+    - name: Add instances to host group
+      add_host:
+        host_key_checking: false
+        hostname: "{{ item.public_dns_name }}"
+        groupname: "web_instances"
+        ansible_user: "{{ user_name }}"
+        ansible_ssh_private_key_file: "{{ key_location }}"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+      loop: "{{ lb_info.instances }}"
+
+    - name: List of instances
+      debug:
+        msg: "{{ item }}"
+      with_items: "{{ groups['web_instances'] }}"
+
+- name: Configure instance(s)
+  hosts: web_instances
+  gather_facts: false
+  connection: ssh
+
+  tasks:
+    - name: setup nginx
+      template:
+        src: nginx.conf
+        dest: /etc/nginx/nginx.conf
+      become: yes
+      become_method: sudo
+
+
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      become: yes
+      become_method: sudo
+
+    - name: List of instances
+      debug:
+        msg: "{{ inventory_hostname }}"
+
